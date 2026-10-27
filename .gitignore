@@ -1,0 +1,7 @@
+Sources/Translater/ServerSecret.swift
+.build/
+Core/.build/
+xtool/
+.bsp/
+Models/
+SelfTest/fast200.mp3

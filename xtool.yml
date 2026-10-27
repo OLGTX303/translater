@@ -1,0 +1,9 @@
+version: 1
+bundleID: com.example.translater
+product: Translater
+infoPath: Translater-Info.plist
+# Whisper models are not bundled: ModelStore downloads them once into Application Support, which
+# survives updates, so each install is a few MB instead of 1.5 GB.
+resources:
+  - SelfTest/fast200.mp3
+  - SelfTest/fast.txt      # the clip's script, for the speed test's word error rate
