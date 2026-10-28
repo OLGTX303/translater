@@ -7,9 +7,10 @@ let sample: [Segment] = [
             words: [Word(text: "Selamat", start: 0.48, end: 1.0),
                     Word(text: "pagi", start: 1.12, end: 1.6),
                     Word(text: "semua", start: 1.7, end: 2.915)]),
-    Segment(id: 1, startTime: 3.2, endTime: 3.9, malay: "", isUnclear: true),
+    Segment(id: 1, startTime: 3.2, endTime: 3.9, malay: "Bikini Bikini", isUnclear: true),
     Segment(id: 2, startTime: 3661.007, endTime: 3665.5, malay: "Terima kasih", english: nil, isLowConfidence: true),
-    Segment(id: 3, startTime: 3666, endTime: 3667.25, malay: "See you tomorrow", english: "See you tomorrow", otherLanguage: "en"),
+    Segment(id: 3, startTime: 3666, endTime: 3667.25, malay: "Nanri", english: "Thank you", otherLanguage: "ta"),
+    Segment(id: 4, startTime: 3668, endTime: 3669.5, malay: "See you tomorrow", english: "See you tomorrow", otherLanguage: "en"),
 ]
 
 /// Pulls every "a --> b" cue time and every <hh:mm:ss.mmm> word tag back out as seconds.
@@ -44,7 +45,11 @@ func roundTrip(format: SubtitleFormat, bilingual: Bool) {
     }
     #expect(parsed.words == (format == .vtt ? [0.48, 1.12, 1.7] : []))
     #expect(text.contains("[unclear]"))
-    #expect(text.contains("[other language: en] See you tomorrow"))
+    #expect(!text.contains("Bikini"))   // an unclear stretch is marked, its guessed text never shown
+    #expect(text.contains("[other language: ta] Nanri"))
+    // English is shown once: no marker, no duplicate English line.
+    #expect(!text.contains("[other language: en]"))
+    #expect(text.components(separatedBy: "See you tomorrow").count == 2)
     #expect(text.contains("Good morning everyone") == bilingual)
     #expect(text.hasPrefix("WEBVTT") == (format == .vtt))
     #expect(text.contains("01:01:01" + (format == .srt ? ",007" : ".007")))

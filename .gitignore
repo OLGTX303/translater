@@ -5,3 +5,8 @@ xtool/
 .bsp/
 Models/
 SelfTest/fast200.mp3
+
+# Local recordings for testing: never commit
+*.mp4
+*.m4a
+*.wav

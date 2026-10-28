@@ -64,7 +64,7 @@ struct LyricLine: View {
         VStack(alignment: .leading, spacing: 6) {
             malay
                 .font(.title.bold())
-            if let english = segment.english {
+            if let english = segment.english, english != segment.malay {
                 Text(english)
                     .font(.title3)
                     .foregroundStyle(.secondary)
@@ -82,6 +82,8 @@ struct LyricLine: View {
     }
 
     private var malay: Text {
+        // Whisper's guess for an unclear stretch is unreliable: show that there was speech, not the guess.
+        if segment.isUnclear { return Text("[unclear]").italic().foregroundStyle(.tertiary) }
         let prefix = Text(segment.marker).italic()
         // Word-by-word sync on the active line when timings exist; otherwise the whole line lights up.
         guard distance == 0, wordHighlighting, !segment.words.isEmpty else {

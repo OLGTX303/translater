@@ -39,10 +39,11 @@ public struct Segment: Identifiable, Codable, Hashable, Sendable {
         self.words = words
     }
 
-    /// "[unclear] " / "[other language: en] " / "", shown before the text on screen and in subtitles.
+    /// "[unclear] " / "[other language: ta] " / "", shown before the text on screen and in subtitles.
+    /// English needs no marker: it's readable as it is.
     public var marker: String {
         if isUnclear { return "[unclear] " }
-        if let otherLanguage { return "[other language: \(otherLanguage)] " }
+        if let otherLanguage, otherLanguage != "en" { return "[other language: \(otherLanguage)] " }
         return ""
     }
 }

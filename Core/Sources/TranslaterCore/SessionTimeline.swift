@@ -43,15 +43,18 @@ public final class SessionTimeline {
 
     /// Runs both pipelines until the recorder finishes or the calling task is cancelled.
     /// `record` pushes Malay utterances into the continuation it's given and returns when done.
+    /// `translateAll`: for files, where nobody is waiting live, every line is translated instead of
+    /// dropping to the newest.
     public func run(
         record: @escaping @Sendable (AsyncStream<Utterance>.Continuation) async throws -> Void,
-        translator: TranslatorActor
+        translator: TranslatorActor,
+        translateAll: Bool = false
     ) async throws {
         let (malay, malayOut) = AsyncStream.makeStream(of: Utterance.self)
         // Bounded on purpose: when translation falls behind, the oldest waiting
         // segments are dropped so the translator always works on the newest speech.
         let (toTranslate, translateIn) = AsyncStream.makeStream(
-            of: Utterance.self, bufferingPolicy: .bufferingNewest(TranslatorActor.backlog))
+            of: Utterance.self, bufferingPolicy: translateAll ? .unbounded : .bufferingNewest(TranslatorActor.backlog))
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
@@ -92,6 +95,12 @@ public actor TranslatorActor {
             var segment = utterance.segment
             // Nothing to translate in unclear audio or a bare "♪" music line.
             guard !segment.isUnclear, segment.malay.contains(where: \.isLetter) else { continue }
+            // Already English: shown once, never sent to a model.
+            if segment.otherLanguage == "en" {
+                segment.english = segment.malay
+                await emit(segment)
+                continue
+            }
             #if os(iOS) || os(macOS)
             // A heavy model on a hot device is rationed so recognition keeps real-time pace: at "serious"
             // one line per 8 s, at "critical" none. Skipping everything at "serious" left a warm iPad

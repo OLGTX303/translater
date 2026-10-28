@@ -47,7 +47,7 @@ private struct StatusStrip: View {
                 Label(RecordingPlayer.clock(elapsed), systemImage: "play.fill")
                     .foregroundStyle(.secondary)
             }
-            Text("MS → EN").foregroundStyle(.secondary)
+            Text(SpokenLanguage.current.route).foregroundStyle(.secondary)
             Text(translator.label).foregroundStyle(.blue)
             Spacer()
             if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue {
@@ -72,7 +72,7 @@ private struct SpeedCard: View {
     var body: some View {
         let segments = timeline.segments
         VStack(alignment: .leading, spacing: 4) {
-            Text(live ? "Live · Malay → English" : "Replay")
+            Text(live ? "Live · \(SpokenLanguage.current.label)" : "Replay")
                 .font(.footnote).foregroundStyle(.secondary)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(wordsPerMinute.map(String.init) ?? "—")

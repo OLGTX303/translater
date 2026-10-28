@@ -13,7 +13,7 @@ public enum SubtitleExport {
             out += "\(n + 1)\n"
             out += "\(timestamp(s.startTime, format)) --> \(timestamp(s.endTime, format))\n"
             out += malayLine(s, timed: format == .vtt && wordTags) + "\n"
-            if bilingual, let english = s.english, !english.isEmpty { out += english + "\n" }
+            if bilingual, let english = s.english, !english.isEmpty, english != s.malay { out += english + "\n" }
             out += "\n"
         }
         return out
@@ -43,7 +43,8 @@ public enum SubtitleExport {
             ? s.words.map { "<\(timestamp($0.start, .vtt))><c>\($0.text.trimmingCharacters(in: .whitespaces))</c>" }
                 .joined(separator: " ")
             : s.malay.trimmingCharacters(in: .whitespaces)
-        return text.isEmpty && s.isUnclear ? "[unclear]" : s.marker + text
+        // Whisper's guess for an unclear stretch is unreliable: mark the stretch, don't show the guess.
+        return s.isUnclear ? "[unclear]" : s.marker + text
     }
 
     /// SRT: 00:01:02,345   VTT: 00:01:02.345

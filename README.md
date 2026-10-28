@@ -6,13 +6,21 @@ Apple Music–style lyrics on a Tesla-style dashboard. Sessions are recorded and
 exported as SRT / WebVTT subtitles.
 
 Tested on an 11-inch iPad Pro (M2, iPadOS 26.2) with a 200 words-per-minute Malay news clip: it keeps up
-in real time with a word error rate of about 4%.
+in real time with a word error rate of about 4%. Accuracy depends most on the audio: record in the app
+with the device near the speaker. Heavily compressed, far-field recordings (e.g. forwarded voice notes)
+defeat even full large-v3, and the app marks them `[unclear]` rather than guessing.
 
 ## Features
 
 - **On-device speech recognition**: Whisper large-v3-turbo (fast) or large-v3 (accurate) on the Neural
-  Engine. Malay is detected per utterance; other languages are marked `[other language: xx]`
-  instead of being forced into Malay.
+  Engine. Spoken language is **Malay + English** (default, for classes that switch between them),
+  **Malay** or **English**. English is shown as it is and never translated; Malay is translated;
+  any other language Whisper thinks it hears is treated as noise.
+- **No invented text**: Apple's built-in sound classifier checks that a stretch is speech or singing
+  before Whisper sees it, so doors, air-con and chatter don't turn into made-up sentences. Stock
+  hallucinations ("thank you for watching", "subtitles by…", web addresses), loops and repeats are
+  dropped, decoding length is capped per second of audio, and stretches Whisper itself finds unclear
+  are shown as `[unclear]` without its guess.
 - **Sentence-accurate lines**: lines are rebuilt from Whisper's word timings so each one runs from
   sentence end to sentence end; an unfinished sentence is held back and re-read with the audio that
   follows instead of being cut in half.
@@ -25,6 +33,8 @@ in real time with a word error rate of about 4%.
   actors; when translation falls behind it drops to the newest lines rather than queueing.
 - **Synced display**: active line large and centred, word-by-word highlight when timings exist,
   tilted "road" view, words-per-minute card and a session map. Respects Reduce Motion.
+- **Import a recording**: any audio or video file runs through the same pipeline and becomes a
+  normal, replayable, exportable session.
 - **Recording and replay**: AAC recording at the mic's native rate, Voice Memos-style player
   (waveform scrubbing, ±15 s, 0.5×–2×), tap a line to jump.
 - **Subtitle export**: SRT and WebVTT, Malay-only or bilingual, `[unclear]` lines kept and marked,
@@ -42,6 +52,8 @@ Sources/Translater/       The iOS app (SwiftUI)
   ServerTranslator.swift    HTTPS client for Server/
   AppleTranslator.swift     Apple Translation framework
   WhisperTranslator.swift   Whisper's translate task
+  SpeechGate.swift          Apple sound classifier: only speech/singing reaches Whisper
+  FileTranscriber.swift     imported recordings through the live pipeline
   ModelStore.swift          one-time model download into Application Support
   Dashboard.swift, LyricsView.swift, RecordingPlayer.swift
 Server/                   NLLB-200 translation service (Docker) + example nginx site

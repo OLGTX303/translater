@@ -1,6 +1,7 @@
 import AVFoundation
 import SwiftUI
 import Translation
+import UniformTypeIdentifiers
 import _Translation_SwiftUI   // .translationTask; xtool on Linux doesn't apply the SwiftUI+Translation cross-import overlay
 import TranslaterCore
 
@@ -20,6 +21,17 @@ struct TranslaterApp: App {
                     try? await Task.sleep(for: .seconds(2))   // let the log flush
                     exit(0)
                 }
+                // `--transcribe=<file>`: a bundled or Documents file through the pipeline, then quit.
+                if let name = CommandLine.arguments.first(where: { $0.hasPrefix("--transcribe=") })?
+                    .split(separator: "=", maxSplits: 1).last.map(String.init) {
+                    let url = Bundle.main.url(forResource: name, withExtension: nil)
+                        ?? URL.documentsDirectory.appending(path: name)
+                    do { _ = try await FileTranscriber.transcribe(url) } catch {
+                        FileTranscriber.log.error("file failed: \(String(describing: error), privacy: .public)")
+                    }
+                    try? await Task.sleep(for: .seconds(2))
+                    exit(0)
+                }
             }
         }
     }
@@ -33,6 +45,36 @@ enum Pref {
     static let translator = "translator"
     static let customWords = "customWords"
     static let recognition = "recognition"
+    static let spokenLanguage = "spokenLanguage"
+}
+
+/// What the speaker speaks. Fixing it is more accurate than detecting it per utterance.
+enum SpokenLanguage: String, CaseIterable {
+    case malay, english, auto
+
+    var label: String {
+        switch self {
+        case .malay: "Malay"
+        case .english: "English"
+        case .auto: "Malay + English"
+        }
+    }
+
+    /// For the status strip: what's heard → what's shown.
+    var route: String {
+        switch self {
+        case .malay: "MS → EN"
+        case .english: "EN"
+        case .auto: "MS+EN → EN"
+        }
+    }
+
+    /// The Settings choice; a `--lang=malay|english|auto` launch argument overrides it (for test runs).
+    static var current: SpokenLanguage {
+        let override = CommandLine.arguments.first { $0.hasPrefix("--lang=") }?.split(separator: "=").last
+        return override.flatMap { Self(rawValue: String($0)) }
+            ?? UserDefaults.standard.string(forKey: Pref.spokenLanguage).flatMap(Self.init) ?? .auto
+    }
 }
 
 /// Settings switch. Apple and Whisper run on the iPad's Neural Engine; Server runs on the N100.
@@ -176,7 +218,7 @@ struct LiveView: View {
                 status = "Loading model…"
                 // One after the other so two large downloads and ANE compiles don't fight.
                 let recorder = try await RecorderActor(model: RecognitionChoice.current.model, clock: clock, rawAudioURL: audioURL,
-                                                       customWords: customWords)
+                                                       customWords: customWords, language: SpokenLanguage.current)
                 let translator = try await TranslatorChoice.current.load()
                 self.recorder = recorder
                 status = "Listening"
@@ -210,20 +252,62 @@ struct LiveView: View {
 
 struct SessionsView: View {
     @State private var files: [URL] = []
+    @State private var importing = false
+    @State private var progress: String?
 
     var body: some View {
         NavigationStack {
-            List(files, id: \.self) { url in
-                NavigationLink(url.deletingPathExtension().lastPathComponent) { ReplayView(url: url) }
+            List {
+                if let progress {
+                    Label(progress, systemImage: "waveform").foregroundStyle(.secondary)
+                }
+                ForEach(files, id: \.self) { url in
+                    NavigationLink(url.deletingPathExtension().lastPathComponent) { ReplayView(url: url) }
+                }
             }
-            .overlay { if files.isEmpty { ContentUnavailableView("No saved sessions", systemImage: "tray") } }
+            .overlay {
+                if files.isEmpty && progress == nil {
+                    ContentUnavailableView("No saved sessions", systemImage: "tray",
+                                           description: Text("Record on the Live tab, or import a recording."))
+                }
+            }
             .navigationTitle("Sessions")
-            .onAppear {
-                files = ((try? FileManager.default.contentsOfDirectory(at: .documentsDirectory, includingPropertiesForKeys: nil)) ?? [])
-                    .filter { $0.pathExtension == "json" }
-                    .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            .toolbar {
+                Button("Import recording", systemImage: "square.and.arrow.down") { importing = true }
+                    .disabled(progress != nil)
             }
+            .fileImporter(isPresented: $importing, allowedContentTypes: [.audio, .movie]) { result in
+                guard case .success(let url) = result else { return }
+                Task { await transcribe(url) }
+            }
+            .onAppear(perform: reload)
         }
+    }
+
+    private func reload() {
+        files = ((try? FileManager.default.contentsOfDirectory(at: .documentsDirectory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    /// Imported files come from outside the sandbox: copy first, then transcribe the copy.
+    private func transcribe(_ picked: URL) async {
+        let copy = URL.temporaryDirectory.appending(path: picked.lastPathComponent)
+        let access = picked.startAccessingSecurityScopedResource()
+        try? FileManager.default.removeItem(at: copy)
+        try? FileManager.default.copyItem(at: picked, to: copy)
+        if access { picked.stopAccessingSecurityScopedResource() }
+        progress = "Transcribing \(picked.lastPathComponent)…"
+        do {
+            _ = try await FileTranscriber.transcribe(copy) { timeline in
+                progress = "Transcribing… \(timeline.segments.count) lines"
+            }
+            progress = nil
+        } catch {
+            progress = "Import failed: \(error.localizedDescription)"
+        }
+        try? FileManager.default.removeItem(at: copy)
+        reload()
     }
 }
 
@@ -303,6 +387,7 @@ struct SettingsView: View {
     @AppStorage(Pref.translator) private var translator = TranslatorChoice.server
     @AppStorage(Pref.customWords) private var customWords = ""
     @AppStorage(Pref.recognition) private var recognition = RecognitionChoice.fast
+    @AppStorage(Pref.spokenLanguage) private var spokenLanguage = SpokenLanguage.auto
 
     var body: some View {
         NavigationStack {
@@ -319,13 +404,16 @@ struct SettingsView: View {
                     Text("N100 server translates on your home server (about 1 s per line) and keeps the iPad cool; it falls back to Apple Translate when unreachable. Apple Translate and Whisper large-v3 run on the iPad's Neural Engine; Whisper also translates other languages but is slower and runs warmer. Applies from the next session.")
                 }
                 Section {
+                    Picker("Spoken language", selection: $spokenLanguage) {
+                        ForEach(SpokenLanguage.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
                     Picker("Model", selection: $recognition) {
                         ForEach(RecognitionChoice.allCases, id: \.self) { Text($0.label).tag($0) }
                     }
                 } header: {
                     Text("Recognition")
                 } footer: {
-                    Text("Accurate hears Malay better but works the iPad harder; the 200 wpm speed test shows how each does on this device. The first session with a new model downloads it once. Applies from the next session.")
+                    Text("Malay + English suits classes that switch between the two: English is shown as it is, Malay is translated, and any other language is ignored. Pick Malay or English when the whole session is one language; it's more accurate. Accurate hears Malay better but works the iPad harder. Applies from the next session.")
                 }
                 Section {
                     TextField("Lembah Klang, Putrajaya, MRT Circle Line", text: $customWords, axis: .vertical)

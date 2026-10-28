@@ -26,20 +26,24 @@ actor RecorderActor {
     private let log = Logger(subsystem: "Translater", category: "recorder")
     private let signposter = OSSignposter(subsystem: "Translater", category: .pointsOfInterest)
     private var audioIn: AsyncStream<[Float]>.Continuation?
+    private let gate = SpeechGate(format: RecorderActor.format)
     /// Names and places fed to Whisper as its prompt. (Feeding back the previous text as well was
     /// measured on the 200 wpm clip: WER 3.6% → 4.3% and it dropped the final sentence, so it's out.)
     private let customWords: String
+    private let language: SpokenLanguage
     /// `--plain-asr` turns off held-back sentences, sentence lines and the prompt (A/B runs of the speed test).
     private let plain = CommandLine.arguments.contains("--plain-asr")
     /// Session time of the first captured sample; replay adds it to the audio file's position.
     private(set) var audioOrigin = 0.0
 
     /// `customWords`: names and places to steer spelling ("Lembah Klang, Putrajaya").
-    init(model: String, clock: SessionClock, rawAudioURL: URL?, customWords: String = "") async throws {
+    init(model: String, clock: SessionClock, rawAudioURL: URL?, customWords: String = "",
+         language: SpokenLanguage = .malay) async throws {
         whisper = try await WhisperKit(ModelStore.config(model))
         self.clock = clock
         self.rawAudioURL = rawAudioURL
         self.customWords = customWords.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.language = language
     }
 
     /// Ends capture; `run` transcribes what's left and returns.
@@ -75,6 +79,18 @@ actor RecorderActor {
         /// Transcribe pending[..<cut] and emit it. With `hold`, an unfinished last sentence is kept in
         /// `pending` and re-read together with the audio that follows, instead of being cut in half.
         func commit(upTo cut: Int, hold: Bool) async throws {
+            // Short bursts (under 3 s) need to be mostly voice: that's where Whisper invented
+            // "Terima kasih", "Eh?" and "Bikini Bikini" in a class recording.
+            let needed = cut < 48_000 ? 0.5 : 0.25
+            if !plain, let heard = gate.voicedShare(from: pendingStart, to: pendingStart + cut), heard.share < needed {
+                // Not speech or singing (noise, room sound, instruments): Whisper would only invent text.
+                log.notice("gate: skipped \(Double(cut) / Self.sampleRate, format: .fixed(precision: 1))s, \(Int(heard.share * 100))% voiced, mostly \(heard.top, privacy: .public)")
+                pending.removeFirst(cut)
+                pendingStart += cut
+                heldAt = nil
+                if pending.isEmpty { lastSpeech = nil }
+                return
+            }
             let (utterances, consumed) = try await transcribe(Array(pending[..<cut]), startSample: pendingStart,
                                                               firstID: nextID, holdUnfinished: hold && !plain)
             utterances.forEach { emit.yield($0) }
@@ -94,6 +110,7 @@ actor RecorderActor {
             // Floor drops at once to quieter audio and creeps up slowly, so speech doesn't raise it.
             noiseFloor = min(rms, noiseFloor! + (rms - noiseFloor!) * 0.002)
             pending += chunk
+            gate.feed(chunk, format: Self.format)
             let end = pendingStart + pending.count
             if rms > max(minSpeechRMS, noiseFloor! * speechRatio) { lastSpeech = end }
             if end - lastLevelLog >= 16_000 {
@@ -149,21 +166,10 @@ actor RecorderActor {
                     holdUnfinished: Bool = false) async throws -> (utterances: [Utterance], consumed: Int) {
         let started = ContinuousClock.now
         let state = signposter.beginInterval("transcribe", id: signposter.makeSignpostID(), "\(samples.count) samples")
-        // One pass: WhisperKit detects the language from the same encoder output it transcribes with.
-        var results = try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: nil))
-        let detected = results.first?.language ?? "ms"
-        var isMalay = detected == "ms"
-        if !isMalay {
-            // Whisper often calls Malay Indonesian, and music got jw/km/ko. Re-read it as Malay and keep
-            // whichever reading Whisper is more confident in (Malay wins near-ties). The second pass
-            // only happens for audio that wasn't detected as Malay.
-            let malay = try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: "ms"))
-            if Self.confidence(malay) >= Self.confidence(results) - 0.15 || Self.malayCodes.contains(detected) {
-                results = malay
-                isMalay = true
-            }
-        }
-        let language = isMalay ? "ms" : detected
+        maxTokens = min(224, 16 + samples.count * 10 / 16_000)
+        let (results, detected, spoken) = try await recognise(samples)
+        let isMalay = spoken == "ms"
+        let language = spoken
         signposter.endInterval("transcribe", state)
         let audioSeconds = Double(samples.count) / Self.sampleRate
         let took = started.duration(to: .now) / .seconds(1)
@@ -187,16 +193,30 @@ actor RecorderActor {
             log.notice("holding unfinished: \(last.text, privacy: .public)")
         }
         var utterances: [Utterance] = []
+        var previous = ""
         for line in lines {
             // "[MUSIC PLAYING]", "(upbeat music)", "*Lirik*", "[음악]": Whisper's sound labels, not words.
             let raw = Self.isSoundLabel(line.text) ? "♪" : line.text
             let text = Self.removingOutro(raw)
             // Only an invented outro (Whisper's guess for silence or noise): not a line at all.
             if text.isEmpty && !raw.isEmpty { continue }
+            if !plain, let why = Self.inventedReason(text, previous: previous, alone: lines.count == 1) {
+                log.notice("dropped (\(why, privacy: .public)): \(text, privacy: .public)")
+                continue
+            }
+            previous = text
             // Whisper's timestamps can run past the chunk (or come back reversed); building that
             // range unclamped crashed the app on the final flush after Stop.
             let lower = Self.sampleIndex(line.start, in: samples)
             let audioRange = lower..<max(lower, Self.sampleIndex(line.end, in: samples))
+            let unclear = text.isEmpty
+                || line.parents.contains { $0.noSpeechProb > 0.6 || $0.compressionRatio > 2.4 }
+                || line.parents.contains { Self.isLikelyHallucination(text, $0) }
+            // A run of unclear lines ("[unclear] we," "[unclear] but," "[unclear] I,") is one stretch.
+            if unclear, let last = utterances.last, last.segment.isUnclear {
+                utterances[utterances.count - 1].segment.endTime = base + Double(line.end)
+                continue
+            }
             utterances.append(Utterance(
                 segment: Segment(
                     id: firstID + utterances.count,
@@ -204,9 +224,7 @@ actor RecorderActor {
                     endTime: base + Double(line.end),
                     malay: text,
                     isLowConfidence: line.parents.contains { $0.avgLogprob < -0.8 },
-                    isUnclear: text.isEmpty
-                        || line.parents.contains { $0.noSpeechProb > 0.6 || $0.compressionRatio > 2.4 }
-                        || line.parents.contains { Self.isLikelyHallucination(text, $0) },
+                    isUnclear: unclear,
                     otherLanguage: isMalay ? nil : language,
                     // Word timings only when the words still match the text (an outro wasn't cut off).
                     words: text != raw ? [] : line.words.map {
@@ -277,11 +295,53 @@ actor RecorderActor {
     }
 
     static let malayCodes: Set<String> = ["ms", "id"]
+    /// Auto mode keeps Malay and English; anything else detected is noise and dropped.
+    static let autoLanguages: Set<String> = ["ms", "en"]
 
-    // Two fallbacks instead of five: music made each extra pass cost seconds.
+    /// Whisper's reading of one cut, the language it detected, and the language the text is in.
+    private func recognise(_ samples: [Float]) async throws -> ([TranscriptionResult], String, String) {
+        switch language {
+        case .english:
+            // One known language: no guessing, no second-guessing. Re-reading English as Malay on
+            // near-ties is what turned an English lecture into Malay-shaped nonsense.
+            return (try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: "en")), "en", "en")
+        case .auto:
+            // Whisper's own detection, from the same encoder pass it transcribes with. Only "Indonesian"
+            // is re-read as Malay: it's Whisper's usual label for Malay speech. Every other language
+            // (Russian, Japanese, Spanish… seen on noise) is dropped as noise.
+            let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: nil))
+            let detected = results.first?.language ?? "en"
+            if detected == "id" {
+                return (try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: "ms")), detected, "ms")
+            }
+            return (Self.autoLanguages.contains(detected) ? results : [], detected, detected)
+        case .malay:
+            let results = try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: nil))
+            let detected = results.first?.language ?? "ms"
+            guard detected != "ms" else { return (results, detected, "ms") }
+            // Whisper often calls Malay Indonesian, and music got jw/km/ko. Re-read it as Malay and keep
+            // whichever reading Whisper is more confident in (Malay wins near-ties). The second pass
+            // only happens for audio that wasn't detected as Malay.
+            let malay = try await whisper.transcribe(audioArray: samples, decodeOptions: options(language: "ms"))
+            // Only English may stand against Malay here; any other detected language is a misreading.
+            if detected != "en" || Self.confidence(malay) >= Self.confidence(results) - 0.15 {
+                return (malay, detected, "ms")
+            }
+            return (results, detected, detected)
+        }
+    }
+
+    /// Tokens Whisper may write for the current cut: 10 per second of audio (fast Malay at 200 wpm
+    /// needs about 6) plus headroom. Without it, a confused 2 s cut looped to 224 tokens per pass and
+    /// took 73 s.
+    private var maxTokens = 224
+
+    // One fallback instead of five: on noise every extra pass only produced more invented text, and
+    // a looping cut cost 43 s with two.
     private func options(language: String?) -> DecodingOptions {
-        DecodingOptions(language: language, temperatureFallbackCount: 2, detectLanguage: language == nil,
-                        skipSpecialTokens: true, wordTimestamps: true, promptTokens: promptTokens())
+        DecodingOptions(language: language, temperatureFallbackCount: 1, sampleLength: maxTokens,
+                        detectLanguage: language == nil, skipSpecialTokens: true, wordTimestamps: true,
+                        promptTokens: promptTokens())
     }
 
     /// Mean log-probability over a transcription's segments; higher is more confident.
@@ -307,6 +367,44 @@ actor RecorderActor {
             }
         }
         return text
+    }
+
+    // Lines Whisper invents from its training videos. Dropped wherever they appear, at any confidence:
+    // a class doesn't say "subtitles by" or "thanks for watching".
+    static let inventedPhrases = [
+        "thank you for watching", "thanks for watching", "thank you so much for watching",
+        "subtitles by", "subtitle by", "captions by", "transcribed by", "translated by",
+        "please subscribe", "like and subscribe", "don't forget to subscribe", "amara.org",
+        "terima kasih kerana menonton", "terima kasih telah menonton", "terima kasih kerana mendengar",
+        "jangan lupa langgan", "jangan lupa subscribe", "sila langgan", "sari kata oleh", "terjemahan oleh",
+        "see you next time", "see you in the next video", "see you in the next one",
+        ".com", ".net", ".org", "www.", "/subs", "http",
+    ]
+    // Misspelt outros ("Terima kasih kerena menerima video ini", "keranya menonton"): thanks plus a
+    // word only video outros use.
+    static let outroWords = ["menonton", "tonton", "video", "subscribe", "langgan", "watching"]
+    // Thanks on its own, as Whisper writes it for a cough or a door: dropped when it's all a chunk held.
+    static let bareThanks: Set<String> = ["terima kasih", "terimaku", "terimu kasih", "thank you", "thanks",
+                                          "terima kasih banyak", "thank you very much", "okay terima kasih"]
+
+    /// Why a line is Whisper's invention rather than speech, or nil if it looks real.
+    static func inventedReason(_ text: String, previous: String, alone: Bool) -> String? {
+        let lower = text.lowercased()
+        if inventedPhrases.contains(where: lower.contains) { return "stock phrase" }
+        if (lower.contains("terima") || lower.contains("thank")), outroWords.contains(where: lower.contains) {
+            return "outro"
+        }
+        let bare = lower.filter { $0.isLetter || $0 == " " }.trimmingCharacters(in: .whitespaces)
+        if alone, bareThanks.contains(bare) { return "bare thanks" }
+        // "- -", "...", "♪ ♪ ♪": nothing said. A single ♪ stays as the music marker.
+        if text != "♪", !text.contains(where: \.isLetter) { return "no words" }
+        // "I can't believe it. I can't believe it.": the same sentence again.
+        let normalized = lower.filter { $0.isLetter || $0 == " " }
+        if !normalized.isEmpty, normalized == previous.lowercased().filter({ $0.isLetter || $0 == " " }) { return "repeat" }
+        // "Thank you. Thank you.", "日本 日本 日本": a few words looping.
+        let words = normalized.split(separator: " ")
+        if words.count >= 4, Set(words).count * 3 <= words.count { return "loop" }
+        return nil
     }
 
     /// A stock outro phrase is only trusted when Whisper was confident it heard speech.
